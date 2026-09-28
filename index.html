@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Heltec GPS Bearings & Compass Tracker</title>
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; display: flex; flex-direction: column; height: 100vh; background-color: #121212; color: #fff; }
+    
+    header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; background-color: #1e1e1e; border-bottom: 1px solid #333; }
+    h1 { font-size: 1.1rem; font-weight: 600; }
+    
+    .btn-group { display: flex; gap: 8px; }
+    .btn { background-color: #007bff; color: white; border: none; padding: 8px 12px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: background 0.2s; font-size: 0.82rem; }
+    .btn:hover { background-color: #0056b3; }
+    .btn-secondary { background-color: #333; color: #ccc; border: 1px solid #555; }
+    .btn-secondary:hover { background-color: #444; color: #fff; }
+    
+    #status-bar { display: flex; flex-wrap: wrap; gap: 15px; padding: 10px 20px; background-color: #252525; font-size: 0.85rem; border-bottom: 1px solid #333; }
+    .status-item { display: flex; gap: 6px; align-items: center; }
+    .label { color: #aaa; }
+    .value { font-weight: 600; color: #00e676; }
+    
+    #map { flex: 1; width: 100%; }
+
+    .compass-arrow-icon {
+      transition: transform 0.15s ease-out;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <h1>Heltec GPS & Compass</h1>
+    <div class="btn-group">
+      <button id="compassBtn" class="btn btn-secondary">Enable Compass</button>
+      <button id="fitBoundsBtn" class="btn btn-secondary">Fit Both</button>
+      <button id="connectBtn" class="btn">Connect BLE</button>
+    </div>
+  </header>
+
+  <div id="status-bar">
+    <div class="status-item"><span class="label">BLE:</span><span id="bleStatus" class="value" style="color: #ff5252;">Disconnected</span></div>
+    <div class="status-item"><span class="label">Compass:</span><span id="compassStatus" class="value" style="color: #ffb300;">Off</span></div>
+    <div class="status-item"><span class="label">Distance:</span><span id="distanceVal" class="value" style="color: #00b0ff;">--</span></div>
+    <div class="status-item"><span class="label">Bearing:</span><span id="bearingVal" class="value" style="color: #ffab00;">--</span></div>
+  </div>
+
+  <div id="map"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    // BLE Configuration
+    const SERVICE_UUID           = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const CHARACTERISTIC_UUID_TX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+    // DOM Elements
+    const connectBtn     = document.getElementById('connectBtn');
+    const compassBtn     = document.getElementById('compassBtn');
+    const fitBoundsBtn   = document.getElementById('fitBoundsBtn');
+    const bleStatus      = document.getElementById('bleStatus');
+    const compassStatus  = document.getElementById('compassStatus');
+    const distanceVal    = document.getElementById('distanceVal');
+    const bearingVal     = document.getElementById('bearingVal');
+
+    // Global Navigation State
+    let bleDevice, gattServer, txCharacteristic;
+    let nmeaBuffer = "";
+    
+    let phoneLatLng    = null;
+    let targetLatLng   = null;
+    let deviceHeading  = 0; // Physical phone compass heading (0-360 deg)
+    let targetBearing  = 0; // True bearing to transmitter (0-360 deg)
+
+    // Leaflet Map Setup
+    const map = L.map('map').setView([0, 0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap contributors'
+    }).addTo(map);
+
+    // Marker Icons
+    const blueIcon = new L.Icon({
+      iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png',
+      shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+      iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+    });
+
+    const redIcon = new L.Icon({
+      iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+      shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+      iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], shadowSize: [41, 41]
+    });
+
+    let userMarker = null;
+    let userAccuracyCircle = null;
+    let targetMarker = null;
+    let arrowMarker = null;
+    
+    let pathPolyline = L.polyline([], { color: '#ff5252', weight: 3, opacity: 0.6 }).addTo(map);
+    let bearingLine  = L.polyline([], { color: '#00b0ff', weight: 3, dashArray: '6, 8' }).addTo(map);
+
+    // --- 1. Trigonometry & Heading Math ---
+    function calculateBearing(lat1, lon1, lat2, lon2) {
+      const radLat1 = lat1 * Math.PI / 180;
+      const radLat2 = lat2 * Math.PI / 180;
+      const dLon    = (lon2 - lon1) * Math.PI / 180;
+
+      const y = Math.sin(dLon) * Math.cos(radLat2);
+      const x = Math.cos(radLat1) * Math.sin(radLat2) -
+                Math.sin(radLat1) * Math.cos(radLat2) * Math.cos(dLon);
+
+      let brng = Math.atan2(y, x) * 180 / Math.PI;
+      return (brng + 360) % 360;
+    }
+
+    function getCardinalDirection(deg) {
+      const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+      const index = Math.round(deg / 45) % 8;
+      return directions[index];
+    }
+
+    function updateNavigationUI() {
+      if (!phoneLatLng || !targetLatLng) return;
+
+      const p1 = L.latLng(phoneLatLng[0], phoneLatLng[1]);
+      const p2 = L.latLng(targetLatLng[0], targetLatLng[1]);
+
+      const meters = p1.distanceTo(p2);
+      distanceVal.innerText = (meters >= 1000) ? (meters / 1000).toFixed(2) + " km" : Math.round(meters) + " m";
+
+      targetBearing = calculateBearing(phoneLatLng[0], phoneLatLng[1], targetLatLng[0], targetLatLng[1]);
+      const cardinal = getCardinalDirection(targetBearing);
+      bearingVal.innerText = `${Math.round(targetBearing)}° (${cardinal})`;
+
+      bearingLine.setLatLngs([phoneLatLng, targetLatLng]);
+
+      // --- Corrected Angle Calculation ---
+      // Reverses relative rotation so turning your physical device aligns the arrow directly on target
+      const relativeAngle = (targetBearing - deviceHeading + 360) % 360;
+      const correctedAngle = (360 - relativeAngle) % 360;
+
+      const arrowSvg = `
+        <div class="compass-arrow-icon" style="transform: rotate(${correctedAngle}deg); width: 40px; height: 40px;">
+          <svg viewBox="0 0 24 24" width="40" height="40" fill="#00b0ff" stroke="#ffffff" stroke-width="1.5">
+            <polygon points="12,2 19,21 12,17 5,21"/>
+          </svg>
+        </div>`;
+
+      const arrowIcon = L.divIcon({
+        html: arrowSvg,
+        className: '',
+        iconSize: [40, 40],
+        iconAnchor: [20, 20]
+      });
+
+      if (!arrowMarker) {
+        arrowMarker = L.marker(phoneLatLng, { icon: arrowIcon, zIndexOffset: 1000 }).addTo(map);
+      } else {
+        arrowMarker.setLatLng(phoneLatLng);
+        arrowMarker.setIcon(arrowIcon);
+      }
+    }
+
+    // --- 2. DeviceOrientation API Handler ---
+    function handleOrientation(event) {
+      if (event.webkitCompassHeading) {
+        // iOS Safari true magnetic heading
+        deviceHeading = event.webkitCompassHeading;
+      } else if (event.alpha !== null) {
+        // Android / Standard device orientation
+        deviceHeading = (360 - event.alpha) % 360;
+      }
+
+      compassStatus.innerText = `${Math.round(deviceHeading)}°`;
+      compassStatus.style.color = "#00e676";
+      updateNavigationUI();
+    }
+
+    function enableCompass() {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        // iOS 13+ permission request
+        DeviceOrientationEvent.requestPermission()
+          .then(response => {
+            if (response === 'granted') {
+              window.addEventListener('deviceorientation', handleOrientation, true);
+              compassBtn.style.display = 'none';
+            } else {
+              compassStatus.innerText = "Permission Denied";
+              compassStatus.style.color = "#ff5252";
+            }
+          })
+          .catch(console.error);
+      } else if ('DeviceOrientationEvent' in window) {
+        // Standard Android / non-iOS browsers
+        window.addEventListener('deviceorientation', handleOrientation, true);
+        compassBtn.style.display = 'none';
+      } else {
+        compassStatus.innerText = "Unsupported";
+        compassStatus.style.color = "#ff5252";
+      }
+    }
+
+    // --- 3. Geolocation Watcher ---
+    if ("geolocation" in navigator) {
+      navigator.geolocation.watchPosition(
+        (position) => {
+          const lat = position.coords.latitude;
+          const lng = position.coords.longitude;
+          const accuracy = position.coords.accuracy;
+
+          phoneLatLng = [lat, lng];
+
+          if (!userMarker) {
+            userMarker = L.marker(phoneLatLng, { icon: blueIcon }).addTo(map).bindPopup("You (Phone)");
+            userAccuracyCircle = L.circle(phoneLatLng, { radius: accuracy, color: '#007bff', opacity: 0.3, fillColor: '#007bff', fillOpacity: 0.1 }).addTo(map);
+            if (!targetLatLng) map.setView(phoneLatLng, 16);
+          } else {
+            userMarker.setLatLng(phoneLatLng);
+            userAccuracyCircle.setLatLng(phoneLatLng);
+            userAccuracyCircle.setRadius(accuracy);
+          }
+
+          updateNavigationUI();
+        },
+        (error) => console.warn("GPS Error:", error.message),
+        { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      );
+    }
+
+    // --- 4. BLE Connection & NMEA Parsing ---
+    function parseNmeaCoord(coordStr, dir) {
+      if (!coordStr || !dir) return null;
+      let degLength = (dir === 'N' || dir === 'S') ? 2 : 3;
+      let degrees = parseFloat(coordStr.slice(0, degLength));
+      let minutes = parseFloat(coordStr.slice(degLength));
+      let decimal = degrees + (minutes / 60.0);
+      if (dir === 'S' || dir === 'W') decimal = -decimal;
+      return decimal;
+    }
+
+    function parseNmeaSentence(sentence) {
+      if (!sentence.startsWith('$GPGGA') && !sentence.startsWith('$GNGGA')) return;
+
+      const parts = sentence.split(',');
+      if (parts.length >= 6) {
+        const lat = parseNmeaCoord(parts[2], parts[3]);
+        const lng = parseNmeaCoord(parts[4], parts[5]);
+
+        if (lat !== null && lng !== null && !isNaN(lat) && !isNaN(lng)) {
+          targetLatLng = [lat, lng];
+
+          if (!targetMarker) {
+            targetMarker = L.marker(targetLatLng, { icon: redIcon }).addTo(map).bindPopup("Transmitter Unit");
+            if (!phoneLatLng) map.setView(targetLatLng, 16);
+          } else {
+            targetMarker.setLatLng(targetLatLng);
+          }
+
+          pathPolyline.addLatLng(targetLatLng);
+          updateNavigationUI();
+        }
+      }
+    }
+
+    async function connectBLE() {
+      try {
+        bleStatus.innerText = "Searching...";
+        bleStatus.style.color = "#ffb300";
+
+        bleDevice = await navigator.bluetooth.requestDevice({
+          filters: [{ name: 'Heltec-GPS-RX' }],
+          optionalServices: [SERVICE_UUID]
+        });
+
+        bleDevice.addEventListener('gattserverdisconnected', () => {
+          bleStatus.innerText = "Disconnected";
+          bleStatus.style.color = "#ff5252";
+          connectBtn.innerText = "Connect BLE";
+        });
+
+        gattServer = await bleDevice.gatt.connect();
+        const service = await gattServer.getPrimaryService(SERVICE_UUID);
+        txCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_TX);
+
+        await txCharacteristic.startNotifications();
+        txCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
+          const decoder = new TextDecoder('utf-8');
+          nmeaBuffer += decoder.decode(event.target.value);
+          let lines = nmeaBuffer.split('\n');
+          nmeaBuffer = lines.pop();
+          for (let line of lines) {
+            if (line.trim().length > 0) parseNmeaSentence(line);
+          }
+        });
+
+        bleStatus.innerText = "Connected";
+        bleStatus.style.color = "#00e676";
+        connectBtn.innerText = "Disconnect";
+      } catch (error) {
+        console.error("BLE Error:", error);
+        bleStatus.innerText = "Error / Cancelled";
+        bleStatus.style.color = "#ff5252";
+      }
+    }
+
+    // Event Listeners
+    compassBtn.addEventListener('click', enableCompass);
+    
+    fitBoundsBtn.addEventListener('click', () => {
+      const bounds = [];
+      if (phoneLatLng) bounds.push(phoneLatLng);
+      if (targetLatLng) bounds.push(targetLatLng);
+      if (bounds.length > 0) map.fitBounds(bounds, { padding: [50, 50] });
+    });
+
+    connectBtn.addEventListener('click', () => {
+      if (bleDevice && bleDevice.gatt.connected) {
+        bleDevice.gatt.disconnect();
+      } else {
+        connectBLE();
+      }
+    });
+  </script>
+</body>
+</html>
